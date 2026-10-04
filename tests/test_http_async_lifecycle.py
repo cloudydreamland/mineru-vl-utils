@@ -125,3 +125,25 @@ def test_failed_batch_waits_for_sibling_cleanup_under_repeated_cancel() -> None:
         assert stopped
 
     asyncio.run(run())
+
+
+def test_aio_batch_predict_isolates_failing_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单个块的失败只留空该块，不拖垮整批（与 llama-cpp 引擎客户端一致）。"""
+    from PIL import Image
+
+    client = HttpVlmClient(server_url="http://test", model_name="test", skip_model_name_checking=True)
+    image = Image.new("RGB", (4, 4), color="white")
+    calls: list[str] = []
+
+    async def aio_predict(self, image, prompt="", sampling_params=None, priority=None):
+        calls.append(prompt)
+        if prompt == "bad":
+            raise RuntimeError("synthetic block failure")
+        return prompt
+
+    monkeypatch.setattr(HttpVlmClient, "aio_predict", aio_predict)
+    results = asyncio.run(client.aio_batch_predict(images=[image, image, image], prompts=["a", "bad", "c"]))
+    assert results == ["a", "", "c"]
+    assert sorted(calls) == ["a", "bad", "c"]

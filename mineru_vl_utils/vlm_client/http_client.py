@@ -568,27 +568,40 @@ class HttpVlmClient(VlmClient):
             semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def predict_with_semaphore(
+            index: int,
             image: ImageType,
             prompt: str,
             sampling_params: SamplingParams | None,
             priority: int | None,
         ):
             async with semaphore:
-                return await self.aio_predict(
-                    image=image,
-                    prompt=prompt,
-                    sampling_params=sampling_params,
-                    priority=priority,
-                )
+                try:
+                    return await self.aio_predict(
+                        image=image,
+                        prompt=prompt,
+                        sampling_params=sampling_params,
+                        priority=priority,
+                    )
+                except Exception as exc:
+                    # 与 batch_predict 的同步路径保持一致：单块失败只留空该块，不拖垮整批。
+                    logger.error(
+                        "Block {} prediction failed, its result is left empty: {}: {}",
+                        index,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    return ""
 
         return await gather_tasks(
             tasks=[
-                predict_with_semaphore(*args)
-                for args in zip(
-                    images,
-                    prompts,
-                    sampling_params,
-                    priority,
+                predict_with_semaphore(index, *args)
+                for index, args in enumerate(
+                    zip(
+                        images,
+                        prompts,
+                        sampling_params,
+                        priority,
+                    )
                 )
             ],
             use_tqdm=use_tqdm,
