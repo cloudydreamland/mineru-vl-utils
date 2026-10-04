@@ -294,17 +294,61 @@ def test_empty_batch_does_not_start_threads_or_progress(mock_engine, monkeypatch
     progress.assert_not_called()
 
 
-def test_batch_failure_closes_progress_and_propagates(mock_engine, image, monkeypatch):
-    """推理失败保持原异常，并退出进度条上下文。"""
+def test_batch_failure_closes_progress_and_isolates(mock_engine, image, monkeypatch):
+    """单块推理失败只让该块留空并记录错误日志，进度条正常收尾，批量调用不再抛出原异常。"""
     client = _make_client(mock_engine)
     bar = MagicMock()
     bar.__enter__.return_value = bar
     monkeypatch.setattr(llama_cpp_engine_client, "tqdm", MagicMock(return_value=bar))
     monkeypatch.setattr(client, "predict", MagicMock(side_effect=ServerError("inference failed")))
-    with pytest.raises(ServerError, match="inference failed"):
-        client.batch_predict([image])
-    assert bar.__exit__.call_args.args[0] is ServerError
-    bar.update.assert_not_called()
+    assert client.batch_predict([image]) == [""]
+    assert bar.__exit__.call_args.args[0] is None
+    bar.update.assert_called_once_with(1)
+
+
+def test_batch_predict_isolates_failing_block(mock_engine, image, monkeypatch):
+    """单块解码错误（如输出在多字节字符中间被截断）只影响该块，其余块照常返回。"""
+
+    def _generate(messages, sp):
+        text_part = next(p for p in messages[-1]["content"] if p["type"] == "text")
+        if text_part["text"] == "bad":
+            raise UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "unexpected end of data")
+        return _stub_generate_result(content=text_part["text"])
+
+    c = _make_client(mock_engine)
+    monkeypatch.setattr(mock_engine, "generate", _generate)
+    results = c.batch_predict(images=[image, image, image], prompts=["ok-1", "bad", "ok-2"])
+    assert results == ["ok-1", "", "ok-2"]
+
+
+def test_batch_predict_isolates_request_error(mock_engine, image, monkeypatch):
+    """单块 RequestError（如长度上限截断且未放行截断内容）同样只影响该块。"""
+    c = _make_client(mock_engine)
+
+    def _generate(messages, sp):
+        text_part = next(p for p in messages[-1]["content"] if p["type"] == "text")
+        if text_part["text"] == "bad":
+            return _stub_generate_result(content="partial", finish_reason="length")
+        return _stub_generate_result(content=text_part["text"])
+
+    monkeypatch.setattr(mock_engine, "generate", _generate)
+    results = c.batch_predict(images=[image, image], prompts=["bad", "good"])
+    assert results == ["", "good"]
+
+
+def test_aio_batch_predict_isolates_failing_block(mock_engine, image, monkeypatch):
+    """异步批量路径与同步路径一致：单块失败只留空该块。"""
+
+    async def _agenerate(messages, sp):
+        text_part = next(p for p in messages[-1]["content"] if p["type"] == "text")
+        if text_part["text"] == "bad":
+            raise UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "unexpected end of data")
+        return _stub_generate_result(content=text_part["text"])
+
+    c = _make_client(mock_engine)
+    monkeypatch.setattr(mock_engine, "agenerate", _agenerate)
+    results = asyncio.run(c.aio_batch_predict(images=[image, image], prompts=["bad", "good"]))
+    assert results == ["", "good"]
 
 
 @pytest.mark.parametrize("use_async", [False, True])

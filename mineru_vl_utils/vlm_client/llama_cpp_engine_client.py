@@ -164,7 +164,11 @@ class LlamaCppEngineVlmClient(VlmClient):
         sampling_params: Sequence[SamplingParams | None] | SamplingParams | None = None,
         priority: Sequence[int | None] | int | None = None,
     ) -> list[str]:
-        """并发提取内容，按完成请求更新进度，并保持输入对应的结果顺序。"""
+        """并发提取内容，按完成请求更新进度，并保持输入对应的结果顺序。
+
+        单个块的推理失败（例如原生层对长度上限截断的输出做严格 UTF-8 解码时抛出
+        UnicodeDecodeError）只影响该块：结果留空并记录错误日志，不会导致整批失败。
+        """
         images_len = len(images)
         if isinstance(prompts, str):
             prompts = [prompts] * images_len
@@ -192,7 +196,13 @@ class LlamaCppEngineVlmClient(VlmClient):
             with tqdm(total=images_len, desc=VLM_PREDICT_DESC, disable=not self.use_tqdm) as pbar:
                 for future in as_completed(futures):
                     # 完成顺序只影响进度显示，内容仍回填到原始请求对应的位置。
-                    results[futures[future]] = future.result()
+                    index = futures[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as exc:
+                        logger.error(
+                            "Block {} prediction failed, its result is left empty: {}: {}", index, type(exc).__name__, exc
+                        )
                     pbar.update(1)
         return results
 
@@ -248,23 +258,29 @@ class LlamaCppEngineVlmClient(VlmClient):
             semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def predict_with_semaphore(
+            index: int,
             image: ImageType,
             prompt: str,
             sampling_params: SamplingParams | None,
             priority: int | None,
         ):
             async with semaphore:
-                return await self.aio_predict(
-                    image=image,
-                    prompt=prompt,
-                    sampling_params=sampling_params,
-                    priority=priority,
-                )
+                try:
+                    return await self.aio_predict(
+                        image=image,
+                        prompt=prompt,
+                        sampling_params=sampling_params,
+                        priority=priority,
+                    )
+                except Exception as exc:
+                    # 与 batch_predict 的同步路径保持一致：单块失败只留空该块，不拖垮整批。
+                    logger.error("Block {} prediction failed, its result is left empty: {}: {}", index, type(exc).__name__, exc)
+                    return ""
 
         return await gather_tasks(
             tasks=[
-                predict_with_semaphore(*args)
-                for args in zip(images, prompts, sampling_params, priority)
+                predict_with_semaphore(index, *args)
+                for index, args in enumerate(zip(images, prompts, sampling_params, priority))
             ],
             use_tqdm=use_tqdm,
             tqdm_desc=tqdm_desc,
